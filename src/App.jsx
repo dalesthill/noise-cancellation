@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from './components/ui/card';
 import { Button } from './components/ui/button';
-import { Mic, MicOff } from 'lucide-react';
+import { Mic, MicOff, Bluetooth, Cable } from 'lucide-react';
 
 const NoiseCancel = () => {
   const [isListening, setIsListening] = useState(false);
