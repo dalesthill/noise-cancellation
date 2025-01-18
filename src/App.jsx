@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from './components/ui/card';
 import { Button } from './components/ui/button';
 import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
@@ -9,15 +9,13 @@ const NoiseCancel = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState('');
   
-  // Audio processing nodes
   const audioContextRef = useRef(null);
   const sourceNodeRef = useRef(null);
   const processorNodeRef = useRef(null);
   const gainNodeRef = useRef(null);
   const filtersRef = useRef([]);
-
-  // Small buffer for low latency
-  const BUFFER_SIZE = 256; // Slightly increased for filter stability
+  
+  const BUFFER_SIZE = 256;
 
   useEffect(() => {
     return () => {
@@ -30,74 +28,29 @@ const NoiseCancel = () => {
   const createCarOptimizedProcessor = (context) => {
     const processor = context.createScriptProcessor(BUFFER_SIZE, 1, 1);
     
-    // Pre-allocate buffers
-    const inputBuffer = new Float32Array(BUFFER_SIZE);
-    const outputBuffer = new Float32Array(BUFFER_SIZE);
-    
-    // Ring buffers for quick frequency analysis
-    const engineBuffer = new Float32Array(16);
-    const tireBuffer = new Float32Array(16);
-    const windBuffer = new Float32Array(16);
-    let bufferIndex = 0;
-    
     processor.onaudioprocess = (audioProcessingEvent) => {
-      const input = audioProcessingEvent.inputBuffer.getChannelData(0);
-      const output = audioProcessingEvent.outputBuffer.getChannelData(0);
+      const inputBuffer = audioProcessingEvent.inputBuffer;
+      const outputBuffer = audioProcessingEvent.outputBuffer;
       
-      // Copy input
-      inputBuffer.set(input);
+      // Get input and output channels
+      const inputData = inputBuffer.getChannelData(0);
+      const outputData = outputBuffer.getChannelData(0);
       
-      // Quick frequency analysis and adaptive gain
+      // Process each sample
       for (let i = 0; i < BUFFER_SIZE; i++) {
-        // Store samples for frequency detection
-        if (i % 16 === 0) {
-          engineBuffer[bufferIndex] = inputBuffer[i];
-          tireBuffer[bufferIndex] = inputBuffer[i];
-          windBuffer[bufferIndex] = inputBuffer[i];
-          bufferIndex = (bufferIndex + 1) % 16;
-        }
-        
-        // Invert and apply frequency-specific gains
-        outputBuffer[i] = -inputBuffer[i];
+        // Include original audio plus inverted noise
+        // This ensures you can hear both your audio and the noise cancellation
+        outputData[i] = inputData[i] + (-inputData[i] * 0.5);
       }
-      
-      // Calculate energy in each frequency band
-      let engineEnergy = 0;
-      let tireEnergy = 0;
-      let windEnergy = 0;
-      
-      for (let i = 0; i < 16; i++) {
-        engineEnergy += engineBuffer[i] * engineBuffer[i];
-        tireEnergy += tireBuffer[i] * tireBuffer[i];
-        windEnergy += windBuffer[i] * windBuffer[i];
-      }
-      
-      // Adjust filter gains based on energy
-      if (filtersRef.current.length >= 3) {
-        filtersRef.current[0].gain.value = -15 * (engineEnergy > 0.1 ? 1.2 : 0.8); // Engine noise
-        filtersRef.current[1].gain.value = -12 * (tireEnergy > 0.1 ? 1.2 : 0.8);  // Tire noise
-        filtersRef.current[2].gain.value = -10 * (windEnergy > 0.1 ? 1.2 : 0.8);  // Wind noise
-      }
-      
-      // Copy to output
-      output.set(outputBuffer);
     };
     
     return processor;
   };
 
-  const createCarNoiseFilter = (context, frequency, Q, gain) => {
-    const filter = context.createBiquadFilter();
-    filter.type = 'peaking';
-    filter.frequency.value = frequency;
-    filter.Q.value = Q;
-    filter.gain.value = gain;
-    return filter;
-  };
-
   const startNoiseCancellation = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
+      // First, request permission for both input and output
+      await navigator.mediaDevices.getUserMedia({ 
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
@@ -107,41 +60,46 @@ const NoiseCancel = () => {
           sampleRate: 48000
         } 
       });
-      
-      const contextOptions = {
+
+      // Create audio context
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         latencyHint: 'playback',
         sampleRate: 48000
-      };
-      
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)(contextOptions);
-      const ctx = audioContextRef.current;
-      
-      // Create nodes
-      sourceNodeRef.current = ctx.createMediaStreamSource(stream);
-      processorNodeRef.current = createCarOptimizedProcessor(ctx);
-      gainNodeRef.current = ctx.createGain();
-      gainNodeRef.current.gain.value = 0.9;
-      
-      // Create car-specific filters
-      filtersRef.current = [
-        createCarNoiseFilter(ctx, 40, 2.0, -15),  // Engine noise (30-45 Hz)
-        createCarNoiseFilter(ctx, 70, 1.5, -12),  // Tire noise (60-80 Hz)
-        createCarNoiseFilter(ctx, 140, 1.0, -10)  // Wind noise (120-160 Hz)
-      ];
-      
-      // Connect nodes
-      sourceNodeRef.current.connect(processorNodeRef.current);
-      let currentNode = processorNodeRef.current;
-      
-      filtersRef.current.forEach(filter => {
-        currentNode.connect(filter);
-        currentNode = filter;
       });
       
-      currentNode.connect(gainNodeRef.current);
+      const ctx = audioContextRef.current;
+
+      // Get all audio devices
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter(device => device.kind === 'audioinput');
+      
+      // Try to use the default input device (usually car microphone when connected)
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          deviceId: audioInputs[0]?.deviceId,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        } 
+      });
+
+      // Create source from microphone input
+      sourceNodeRef.current = ctx.createMediaStreamSource(stream);
+      
+      // Create processor
+      processorNodeRef.current = createCarOptimizedProcessor(ctx);
+      
+      // Create gain node
+      gainNodeRef.current = ctx.createGain();
+      gainNodeRef.current.gain.value = 1.0; // Full volume
+      
+      // Connect the nodes
+      sourceNodeRef.current.connect(processorNodeRef.current);
+      processorNodeRef.current.connect(gainNodeRef.current);
       gainNodeRef.current.connect(ctx.destination);
       
-      if (ctx.resume) {
+      // Resume audio context (needed for some browsers)
+      if (ctx.state === 'suspended') {
         await ctx.resume();
       }
       
@@ -149,16 +107,20 @@ const NoiseCancel = () => {
       setIsProcessing(true);
       setError('');
       
+      console.log('Audio setup complete');
+      console.log('Available audio devices:', audioInputs);
+      console.log('Audio context state:', ctx.state);
+      console.log('Sample rate:', ctx.sampleRate);
+      
     } catch (err) {
-      setError('Error accessing microphone. Please ensure microphone permissions are granted.');
-      console.error('Error:', err);
+      setError('Error: ' + (err.message || 'Could not access audio system'));
+      console.error('Setup error:', err);
     }
   };
 
   const stopNoiseCancellation = () => {
     if (audioContextRef.current) {
       gainNodeRef.current.disconnect();
-      filtersRef.current.forEach(filter => filter.disconnect());
       processorNodeRef.current.disconnect();
       sourceNodeRef.current.disconnect();
       audioContextRef.current.close();
@@ -171,7 +133,7 @@ const NoiseCancel = () => {
   return (
     <Card className="w-full max-w-md mx-auto">
       <CardHeader>
-        <CardTitle className="text-center">Car-Optimized Noise Cancellation</CardTitle>
+        <CardTitle className="text-center">Car Audio Noise Cancellation</CardTitle>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">
@@ -219,14 +181,13 @@ const NoiseCancel = () => {
           )}
 
           <div className="text-center text-sm text-gray-500 mt-4">
-            <p>Car noise optimization:</p>
-            <p>• Engine noise reduction (30-45 Hz)</p>
-            <p>• Tire noise reduction (60-80 Hz)</p>
-            <p>• Wind noise reduction (120-160 Hz)</p>
-            <p>• Adaptive gain control</p>
-            <p>• Fast sample processing</p>
+            <p>Instructions:</p>
+            <p>1. Connect phone to car audio</p>
+            <p>2. Ensure car microphone is selected</p>
+            <p>3. Play some audio to test</p>
+            <p>4. Adjust car volume as needed</p>
             <p className="mt-2 text-yellow-600">
-              For best results, position phone/device closer to noise source
+              Note: You should hear both your audio and noise cancellation
             </p>
           </div>
         </div>
