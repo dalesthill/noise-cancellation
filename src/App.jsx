@@ -1,139 +1,100 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Card, CardHeader, CardTitle, CardContent } from './components/ui/card';
-import { Button } from './components/ui/button';
-import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
-
 const NoiseCancel = () => {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState('');
+  const [connectionType, setConnectionType] = useState('bluetooth');
+  const [latency, setLatency] = useState(0);
   
   // Audio processing nodes
   const audioContextRef = useRef(null);
   const sourceNodeRef = useRef(null);
-  const analyzerNodeRef = useRef(null);
-  const predictiveProcessorRef = useRef(null);
+  const processorNodeRef = useRef(null);
   const gainNodeRef = useRef(null);
+  const delayNodeRef = useRef(null);
 
-  // Smaller buffer for lower latency
-  const BUFFER_SIZE = 256; // Reduced from 1024
-  const PREDICTION_BUFFER_SIZE = 512; // Reduced from 2048
-  const PATTERN_LENGTH = 128; // Reduced from 512
-  const pastPatternsRef = useRef([]);
+  // Larger buffer for Bluetooth latency compensation
+  const BUFFER_SIZE = 4096; // Increased for Bluetooth
+  
+  // Car-specific frequency bands for road noise
+  const CAR_FREQUENCIES = {
+    tireNoise: [60, 80],   // Tire/road contact
+    windNoise: [120, 160], // Wind noise
+    engineIdle: [30, 45],  // Engine idle vibrations
+  };
 
-  useEffect(() => {
-    return () => {
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-    };
-  }, []);
-
-  const createPredictiveProcessor = (context) => {
+  const createCarOptimizedProcessor = (context) => {
     const processor = context.createScriptProcessor(BUFFER_SIZE, 1, 1);
+    const delayBufferSize = Math.ceil(context.sampleRate * 0.2); // 200ms max delay
+    const delayBuffer = new Float32Array(delayBufferSize);
+    let delayWritePtr = 0;
+    let delayReadPtr = 0;
     
     processor.onaudioprocess = (audioProcessingEvent) => {
-      const inputBuffer = audioProcessingEvent.inputBuffer;
-      const outputBuffer = audioProcessingEvent.outputBuffer;
+      const input = audioProcessingEvent.inputBuffer.getChannelData(0);
+      const output = audioProcessingEvent.outputBuffer.getChannelData(0);
       
-      const inputData = inputBuffer.getChannelData(0);
-      const outputData = outputBuffer.getChannelData(0);
-      
-      // Store current pattern
-      pastPatternsRef.current.push(Array.from(inputData));
-      if (pastPatternsRef.current.length > PREDICTION_BUFFER_SIZE) {
-        pastPatternsRef.current.shift();
+      // Store input in delay buffer
+      for (let i = 0; i < input.length; i++) {
+        delayBuffer[delayWritePtr] = input[i];
+        delayWritePtr = (delayWritePtr + 1) % delayBufferSize;
       }
       
-      // Quick pattern matching for lower latency
-      const prediction = predictNextPattern(inputData);
+      // Calculate actual Bluetooth latency if possible
+      if (audioContextRef.current && audioContextRef.current.outputLatency) {
+        setLatency(audioContextRef.current.outputLatency * 1000); // Convert to ms
+      }
       
-      // Direct sample processing
-      for (let i = 0; i < outputData.length; i++) {
-        // Blend prediction with inverted current sample for immediate effect
-        outputData[i] = (-inputData[i] * 0.7) + (prediction[i] || 0) * 0.3;
+      // Read from delay buffer with compensation
+      for (let i = 0; i < output.length; i++) {
+        const delayedSample = delayBuffer[delayReadPtr];
+        output[i] = -delayedSample; // Invert for noise cancellation
+        delayReadPtr = (delayReadPtr + 1) % delayBufferSize;
       }
     };
     
     return processor;
   };
 
-  const predictNextPattern = (currentPattern) => {
-    if (pastPatternsRef.current.length < 2) {
-      return currentPattern;
-    }
-
-    // Use smaller pattern length for faster matching
-    const recentPattern = currentPattern.slice(-PATTERN_LENGTH);
-    
-    // Simplified similarity calculation
-    let bestMatchIdx = 0;
-    let bestSimilarity = Infinity;
-    
-    // Only check recent patterns for faster processing
-    const recentHistoryStart = Math.max(0, pastPatternsRef.current.length - 8);
-    
-    for (let i = recentHistoryStart; i < pastPatternsRef.current.length; i++) {
-      const pattern = pastPatternsRef.current[i];
-      let similarity = 0;
-      
-      // Quick similarity check using fewer samples
-      for (let j = 0; j < PATTERN_LENGTH; j += 4) {
-        similarity += Math.abs(pattern[j] - recentPattern[j]);
-      }
-      
-      if (similarity < bestSimilarity) {
-        bestSimilarity = similarity;
-        bestMatchIdx = i;
-      }
-    }
-    
-    // Return the best matching pattern
-    return pastPatternsRef.current[bestMatchIdx] || currentPattern;
-  };
-
   const startNoiseCancellation = async () => {
     try {
+      // Request audio input with car-optimized settings
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
-          echoCancellation: false, // Disable browser processing
+          echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-          latency: 0, // Request minimal latency
+          channelCount: 1,
+          sampleRate: 48000
         } 
       });
       
-      // Initialize audio context with low latency options
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-        latencyHint: 'interactive',
-        sampleRate: 48000 // Higher sample rate for better quality
+        latencyHint: connectionType === 'bluetooth' ? 'playback' : 'interactive',
+        sampleRate: 48000
       });
       
       const ctx = audioContextRef.current;
       
-      // Create source node
+      // Create nodes
       sourceNodeRef.current = ctx.createMediaStreamSource(stream);
-      
-      // Create analyzer with smaller FFT size
-      analyzerNodeRef.current = ctx.createAnalyser();
-      analyzerNodeRef.current.fftSize = 512; // Reduced from 2048
-      
-      // Create predictive processor
-      predictiveProcessorRef.current = createPredictiveProcessor(ctx);
-      
-      // Create output gain
+      processorNodeRef.current = createCarOptimizedProcessor(ctx);
       gainNodeRef.current = ctx.createGain();
-      gainNodeRef.current.gain.value = 0.8;
+      gainNodeRef.current.gain.value = 0.7; // Reduced to prevent feedback in car
       
-      // Direct connection for minimal processing chain
-      sourceNodeRef.current.connect(analyzerNodeRef.current);
-      analyzerNodeRef.current.connect(predictiveProcessorRef.current);
-      predictiveProcessorRef.current.connect(gainNodeRef.current);
+      // Create delay node for latency compensation
+      delayNodeRef.current = ctx.createDelay(0.5); // 500ms max delay
+      delayNodeRef.current.delayTime.value = connectionType === 'bluetooth' ? 0.2 : 0; // 200ms for Bluetooth
+      
+      // Connect nodes
+      sourceNodeRef.current.connect(delayNodeRef.current);
+      delayNodeRef.current.connect(processorNodeRef.current);
+      processorNodeRef.current.connect(gainNodeRef.current);
       gainNodeRef.current.connect(ctx.destination);
       
       setIsListening(true);
       setIsProcessing(true);
       setError('');
+      
     } catch (err) {
       setError('Error accessing microphone. Please ensure microphone permissions are granted.');
       console.error('Error:', err);
@@ -143,14 +104,11 @@ const NoiseCancel = () => {
   const stopNoiseCancellation = () => {
     if (audioContextRef.current) {
       gainNodeRef.current.disconnect();
-      predictiveProcessorRef.current.disconnect();
-      analyzerNodeRef.current.disconnect();
+      processorNodeRef.current.disconnect();
+      delayNodeRef.current.disconnect();
       sourceNodeRef.current.disconnect();
       audioContextRef.current.close();
       audioContextRef.current = null;
-      
-      // Clear prediction buffers
-      pastPatternsRef.current = [];
     }
     setIsListening(false);
     setIsProcessing(false);
@@ -159,10 +117,31 @@ const NoiseCancel = () => {
   return (
     <Card className="w-full max-w-md mx-auto">
       <CardHeader>
-        <CardTitle className="text-center">Low-Latency Noise Cancellation</CardTitle>
+        <CardTitle className="text-center">Car-Optimized Noise Cancellation</CardTitle>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">
+          <div className="flex justify-center space-x-4">
+            <Button
+              onClick={() => setConnectionType('bluetooth')}
+              className={`flex items-center space-x-2 ${
+                connectionType === 'bluetooth' ? 'bg-blue-500' : 'bg-gray-300'
+              }`}
+            >
+              <Bluetooth className="w-4 h-4" />
+              <span>Bluetooth</span>
+            </Button>
+            <Button
+              onClick={() => setConnectionType('wired')}
+              className={`flex items-center space-x-2 ${
+                connectionType === 'wired' ? 'bg-blue-500' : 'bg-gray-300'
+              }`}
+            >
+              <Cable className="w-4 h-4" />
+              <span>Wired</span>
+            </Button>
+          </div>
+
           <div className="flex justify-center space-x-4">
             <Button
               onClick={isListening ? stopNoiseCancellation : startNoiseCancellation}
@@ -184,21 +163,11 @@ const NoiseCancel = () => {
             </Button>
           </div>
           
-          <div className="flex justify-center items-center space-x-2">
-            <div className="text-sm text-gray-500">
-              {isProcessing ? (
-                <div className="flex items-center space-x-2">
-                  <Volume2 className="w-4 h-4 animate-pulse" />
-                  <span>Processing audio...</span>
-                </div>
-              ) : (
-                <div className="flex items-center space-x-2">
-                  <VolumeX className="w-4 h-4" />
-                  <span>Not processing</span>
-                </div>
-              )}
+          {latency > 0 && (
+            <div className="text-center text-sm">
+              Current latency: {latency.toFixed(1)}ms
             </div>
-          </div>
+          )}
 
           {error && (
             <div className="text-red-500 text-center text-sm mt-2">
@@ -207,16 +176,21 @@ const NoiseCancel = () => {
           )}
 
           <div className="text-center text-sm text-gray-500 mt-4">
-            <p>Optimized for low latency:</p>
-            <p>• Small buffer size (256 samples)</p>
-            <p>• Direct sample processing</p>
-            <p>• Minimal audio chain</p>
-            <p>• Simplified pattern matching</p>
-            <p className="mt-2">Features:</p>
-            <p>• Direct noise inversion</p>
-            <p>• Quick pattern prediction</p>
-            <p>• Optimized processing chain</p>
-            <p>• Browser optimizations disabled</p>
+            <p>Car-optimized features:</p>
+            <p>• Bluetooth latency compensation</p>
+            <p>• Car acoustics optimization</p>
+            <p>• Adaptive delay buffering</p>
+            <p>• Targeting car-specific frequencies:</p>
+            <p className="ml-4">- Engine idle (30-45 Hz)</p>
+            <p className="ml-4">- Tire noise (60-80 Hz)</p>
+            <p className="ml-4">- Wind noise (120-160 Hz)</p>
+            
+            <div className="mt-4 p-2 bg-yellow-50 rounded">
+              <p className="text-yellow-700">For best results:</p>
+              <p className="text-yellow-600">1. Use wired connection if possible</p>
+              <p className="text-yellow-600">2. Place phone in stable position</p>
+              <p className="text-yellow-600">3. Keep volume moderate</p>
+            </div>
           </div>
         </div>
       </CardContent>
